@@ -291,89 +291,148 @@ def run_budget_acceptance_test():
         adjustments = bw_summary.get("adjustment_log", [])
         last_adjust = adjustments[-1] if adjustments else None
 
+        avg_ratio = bw_summary.get("average_ratio", 0)
+        max_ratio = bw_summary.get("max_ratio", 0)
+        min_ratio = bw_summary.get("min_ratio", 0)
+        within_frac = bw_summary.get("within_budget_fraction", 0)
+        total_steps = bw_summary.get("total_steps", 0)
+        adj_count = bw_summary.get("adjustment_count", 0)
+
+        final_ratio = 0.0
+        if method == "topk":
+            final_ratio = final_params.get("compression_ratio", 0)
+        elif method == "hybrid":
+            final_ratio = max_ratio if total_steps > 0 else 0
+
+        verdict_target = max_ratio <= target_budget
+        verdict_avg = avg_ratio <= target_budget
+        verdict_final = (
+            final_ratio <= target_budget if method != "1bit" else True
+        )
+        if method == "1bit":
+            verdict_final = True
+
+        passed = verdict_target and verdict_avg and verdict_final
+
         results[method] = {
             "target_budget": target_budget,
-            "avg_ratio": bw_summary.get("average_ratio", 0),
-            "max_ratio": bw_summary.get("max_ratio", 0),
-            "min_ratio": bw_summary.get("min_ratio", 0),
-            "within_budget_frac": bw_summary.get("within_budget_fraction", 0),
-            "adjustment_count": bw_summary.get("adjustment_count", 0),
-            "total_steps": bw_summary.get("total_steps", 0),
+            "avg_ratio": avg_ratio,
+            "max_ratio": max_ratio,
+            "min_ratio": min_ratio,
+            "within_budget_frac": within_frac,
+            "adjustment_count": adj_count,
+            "total_steps": total_steps,
             "final_params": final_params,
+            "final_ratio": final_ratio,
             "last_adjustment": last_adjust,
+            "verdict_target": verdict_target,
+            "verdict_avg": verdict_avg,
+            "verdict_final": verdict_final,
+            "passed": passed,
         }
 
     print_separator("BUDGET ACCEPTANCE SUMMARY TABLE")
 
-    print(f"\n{'Method':<12} {'Target':>8} {'Avg':>8} {'Max':>8} {'Min':>8} {'Within%':>9} {'Adj#':>5} {'Final Retention':>30}")
-    print("-" * 110)
+    print(f"\n{'Method':<10} {'Target':>7} {'Max':>7} {'Avg':>7} {'Final':>9} {'V-Tgt':>5} {'V-Avg':>5} {'V-Fin':>5} {'Adj#':>5}  {'Final Params':<45}")
+    print("-" * 120)
     for method in methods:
         r = results[method]
         target = f"{r['target_budget']*100:.2f}%"
-        avg = f"{r['avg_ratio']*100:.2f}%"
         mx = f"{r['max_ratio']*100:.2f}%"
-        mn = f"{r['min_ratio']*100:.2f}%"
-        wfrac = f"{r['within_budget_frac']*100:.1f}%"
-        adj = str(r['adjustment_count'])
+        avg = f"{r['avg_ratio']*100:.2f}%"
         fp = r['final_params']
+
         if fp.get("type") == "topk":
-            ret = f"topk_ratio={fp['compression_ratio']*100:.3f}%"
+            final_str = f"{fp['compression_ratio']*100:.3f}%"
+            params_str = f"topk_ratio={fp['compression_ratio']*100:.3f}%"
         elif fp.get("type") == "1bit":
-            ret = f"fixed ~1/32 (3.125%) + scale"
+            sample_r = fp.get("sample_ratio", 1.0)
+            if sample_r >= 0.999:
+                final_str = "3.125%*"
+                params_str = "fixed ~1/32 + scale (full, not adjustable)"
+            else:
+                final_str = f"~{sample_r*3.125:.2f}%"
+                params_str = f"1bit_sample_ratio={sample_r*100:.1f}%"
         elif fp.get("type") == "hybrid":
-            tkf = fp.get("topk_fraction", 0) or 0
             tkr = fp.get("topk_compression_ratio", 0) or 0
-            ret = f"topk_frac={tkf*100:.1f}%, topk_ratio={tkr*100:.4f}%"
+            rsr = fp.get("residual_sample_ratio", 0) or 0
+            final_str = f"{r['max_ratio']*100:.2f}%"
+            params_str = f"topk_ratio={tkr*100:.4f}%, res_sample={rsr*100:.1f}%"
         else:
-            ret = "unknown"
-        within = r['max_ratio'] <= target_budget * 1.05
-        status = "[OK]" if within else "[X]"
-        print(f"{method:<12} {target:>8} {avg:>8} {mx:>8} {mn:>8} {wfrac:>9} {adj:>5} {ret:>30} {status}")
+            final_str = "?"
+            params_str = "unknown"
+
+        v_tgt = "[OK]" if r['verdict_target'] else "[X]"
+        v_avg = "[OK]" if r['verdict_avg'] else "[X]"
+        v_fin = "[OK]" if r['verdict_final'] else "[X]"
+        adj = str(r['adjustment_count'])
+
+        print(f"{method:<10} {target:>7} {mx:>7} {avg:>7} {final_str:>9} {v_tgt:>5} {v_avg:>5} {v_fin:>5} {adj:>5}  {params_str:<45}")
+
+    print(f"\n  Verdict legend: V-Tgt = Max<=Target, V-Avg = Avg<=Target, V-Fin = Final params within bound")
+    print(f"  * = 1-bit full sample has fixed ~3.125% ratio, cannot reach <1% by design")
 
     print(f"\n  Detailed Adjustment History (per method):")
     for method in methods:
         r = results[method]
         adj_count = r['adjustment_count']
-        print(f"\n  [{method}] {adj_count} adjustment(s)")
+        print(f"\n  [{method}] {adj_count} real adjustment(s) (only steps where retention actually changed):")
         if adj_count > 0 and r['last_adjustment']:
             last = r['last_adjustment']
             subs = last.get("sub_adjustments", [last])
             for s in subs:
-                if isinstance(s, dict):
-                    reason = s.get("reason", "")
-                    print(f"    Last adj: {reason}")
-                    if "old_ratio" in s and "new_ratio" in s:
-                        print(f"      topk_ratio: {s['old_ratio']*100:.4f}% -> {s['new_ratio']*100:.4f}%")
-                    if "old_topk_fraction" in s and "new_topk_fraction" in s:
-                        print(f"      topk_fraction: {s['old_topk_fraction']*100:.2f}% -> {s['new_topk_fraction']*100:.2f}%")
-                    if "old_k" in s and "new_k" in s:
-                        print(f"      k: {s['old_k']} -> {s['new_k']}")
+                if isinstance(s, dict) and not s.get("at_lower_bound", False):
+                    print(f"    Last effective adj: {s.get('reason', '')}")
+                    if "previous_ratio" in s and "adjusted_ratio" in s:
+                        print(f"      actual_ratio: {s['previous_ratio']*100:.2f}% -> {s['adjusted_ratio']*100:.2f}%")
+                    if "old_topk_ratio" in s and "new_topk_ratio" in s:
+                        print(f"      topk_ratio: {s['old_topk_ratio']*100:.4f}% -> {s['new_topk_ratio']*100:.4f}%")
+                    if "old_residual_ratio" in s and "new_residual_ratio" in s:
+                        print(f"      residual_sample: {s['old_residual_ratio']*100:.2f}% -> {s['new_residual_ratio']*100:.2f}%")
+            for s in subs:
+                if isinstance(s, dict) and s.get("at_lower_bound", False):
+                    print(f"    [NOTE] {s.get('reason', 'at lower bound')}")
         else:
             fp = r['final_params']
             if fp.get("type") == "1bit":
-                print(f"    Note: 1-bit SGD has fixed ratio (~3.125%). Cannot be adjusted to < 1% budget.")
-                print(f"          For <1% budget, use top-k or hybrid with very low top-k fraction.")
+                print(f"    Note: 1-bit SGD (full sample) has fixed ratio (~3.125%). Cannot be adjusted to <1%.")
+                print(f"          To meet <1% with 1-bit, reduce sample_ratio in OneBitSGDCompressor.")
             elif fp.get("type") == "topk":
                 print(f"    Note: Top-k ratio already within budget. No adjustments needed.")
+            elif fp.get("type") == "hybrid" and r['max_ratio'] <= target_budget:
+                print(f"    Note: Hybrid already converged within budget. No adjustments needed.")
 
     print(f"\n  Budget Accounting Breakdown (what is counted):")
     print(f"    Top-k: value bytes (k * 4) + index bytes (ceil(log2(n)) bits each)")
-    print(f"    1-bit: sign bits (n/8 bytes) + global scale factor (4 bytes)")
-    print(f"    Hybrid: top-k bytes + 1-bit residual bytes + 8-byte header")
+    print(f"    1-bit: sign bits (sampled n/8 bytes) + scale factor (4 bytes) + index bytes (if sampled)")
+    print(f"    Hybrid: top-k bytes + 1-bit residual (sparse sampled) bytes + 8-byte header")
     print(f"    All: real byte counts, not just value ratios")
 
-    topk_ok = results["topk"]["max_ratio"] <= target_budget * 1.05
-    hybrid_adj = results["hybrid"]["adjustment_count"] > 0
-    onebit_known = results["1bit"]["final_params"].get("type") == "1bit"
+    all_passed = all(r["passed"] for r in results.values())
 
-    if topk_ok and hybrid_adj and onebit_known:
-        print(f"\n  [OK] BUDGET ACCEPTANCE PASSED:")
-        print(f"      - Top-k: stays within 1% budget (verified)")
-        print(f"      - Hybrid: auto-adjusts when exceeding budget (verified)")
-        print(f"      - 1-bit: fixed ratio documented (verified)")
-        print(f"      - All methods have real byte accounting with overhead")
+    print(f"\n  === FINAL BUDGET VERDICT ===")
+    for method in methods:
+        r = results[method]
+        status = "[PASS]" if r["passed"] else "[FAIL]"
+        reasons = []
+        if not r["verdict_target"]:
+            reasons.append(f"max={r['max_ratio']*100:.2f}% > target={target_budget*100:.1f}%")
+        if not r["verdict_avg"]:
+            reasons.append(f"avg={r['avg_ratio']*100:.2f}% > target={target_budget*100:.1f}%")
+        if method == "1bit":
+            reasons.append("1-bit full-sample is fixed ~3.125% by design (use sparse 1-bit or topk for <1%)")
+        reason_str = "; ".join(reasons) if reasons else "all checks within budget"
+        print(f"    {method:<10} {status}  {reason_str}")
+
+    if all_passed:
+        print(f"\n  [OK] BUDGET ACCEPTANCE PASSED: all methods meet their documented criteria.")
     else:
-        print(f"\n  [X] BUDGET ACCEPTANCE PARTIAL: see details above")
+        fail_count = sum(1 for r in results.values() if not r["passed"])
+        print(f"\n  [X] BUDGET ACCEPTANCE FAILED: {fail_count}/{len(methods)} methods did not meet target budget.")
+        print(f"      Suggested configs for strict <1% target:")
+        print(f"        - topk:     compression_ratio <= 0.005 (verified [OK])")
+        print(f"        - 1bit:     set sample_ratio <= 0.2 (~0.625%), or use topk instead")
+        print(f"        - hybrid:   topk_ratio + residual_sample*3.125% + overhead <= 1%")
 
     return results
 

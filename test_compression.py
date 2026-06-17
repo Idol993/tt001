@@ -22,8 +22,14 @@ for method in ["topk", "1bit", "hybrid"]:
             for s in subs:
                 if isinstance(s, dict):
                     print(f"    Reason: {s.get('reason', '')}")
+                    if "previous_ratio" in s and "adjusted_ratio" in s:
+                        print(f"    ratio: {s['previous_ratio']*100:.2f}% -> {s['adjusted_ratio']*100:.2f}%")
                     if "old_ratio" in s and "new_ratio" in s:
                         print(f"    topk_ratio: {s['old_ratio']*100:.4f}% -> {s['new_ratio']*100:.4f}%")
+                    if "old_topk_ratio" in s and "new_topk_ratio" in s:
+                        print(f"    topk_ratio: {s['old_topk_ratio']*100:.4f}% -> {s['new_topk_ratio']*100:.4f}%")
+                    if "old_residual_ratio" in s and "new_residual_ratio" in s:
+                        print(f"    residual_sample: {s['old_residual_ratio']*100:.2f}% -> {s['new_residual_ratio']*100:.2f}%")
                     if "old_topk_fraction" in s and "new_topk_fraction" in s:
                         print(f"    topk_frac: {s['old_topk_fraction']*100:.2f}% -> {s['new_topk_fraction']*100:.2f}%")
 

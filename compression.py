@@ -59,16 +59,21 @@ class OneBitSGDCompressor:
         warmup_steps: int = 0,
         target_budget_ratio: float = 0.01,
         auto_adjust: bool = True,
+        sample_ratio: float = 1.0,
+        min_sample_ratio: float = 0.002,
     ):
         self.momentum_factor = momentum_factor
         self.warmup_steps = warmup_steps
         self.target_budget_ratio = target_budget_ratio
         self.auto_adjust = auto_adjust
+        self.sample_ratio = sample_ratio
+        self.min_sample_ratio = min_sample_ratio
         self._step = 0
         self._error_buffers: Dict[str, torch.Tensor] = {}
         self._momentum_buffers: Dict[str, torch.Tensor] = {}
         self._last_bandwidth: Optional[BandwidthAccount] = None
         self._last_adjustment: Optional[Dict] = None
+        self._adjustment_count = 0
 
     def compress(
         self, tensor: torch.Tensor, key: str
@@ -98,28 +103,55 @@ class OneBitSGDCompressor:
             return msg, {"method": "full", "original_shape": tensor.shape}, bw
 
         numel = tensor.numel()
-        mean_abs = self._momentum_buffers[key].abs().mean()
+        flat = self._momentum_buffers[key].reshape(-1)
 
-        signs_bool = self._momentum_buffers[key].reshape(-1) >= 0
+        if self.sample_ratio >= 1.0 - 1e-9:
+            sample_idx = None
+            sampled_flat = flat
+            sampled_numel = numel
+        else:
+            sample_k = max(1, int(numel * self.sample_ratio))
+            sample_k = min(sample_k, numel)
+            _, sample_idx = torch.topk(flat.abs(), sample_k)
+            sampled_flat = flat[sample_idx]
+            sampled_numel = sample_k
+
+        mean_abs = sampled_flat.abs().mean()
+        signs_bool = sampled_flat >= 0
         sign_bytes_tensor = _pack_bits_to_bytes(signs_bool)
         sign_bytes = sign_bytes_tensor.numel()
 
-        reconstructed = _unpack_bytes_to_bits(sign_bytes_tensor, numel)
-        reconstructed = reconstructed.to(torch.float32)
-        reconstructed[reconstructed == 0] = -1.0
-        reconstructed = reconstructed * mean_abs
-        reconstructed = reconstructed.reshape(self._momentum_buffers[key].shape)
+        if sample_idx is None:
+            reconstructed = _unpack_bytes_to_bits(sign_bytes_tensor, sampled_numel)
+            reconstructed = reconstructed.to(torch.float32)
+            reconstructed[reconstructed == 0] = -1.0
+            reconstructed = reconstructed * mean_abs
+            reconstructed = reconstructed.reshape(self._momentum_buffers[key].shape)
+            index_bytes = 0
+        else:
+            sampled_recon = _unpack_bytes_to_bits(sign_bytes_tensor, sampled_numel)
+            sampled_recon = sampled_recon.to(torch.float32)
+            sampled_recon[sampled_recon == 0] = -1.0
+            sampled_recon = sampled_recon * mean_abs
+            reconstructed = torch.zeros_like(flat)
+            reconstructed[sample_idx] = sampled_recon
+            reconstructed = reconstructed.reshape(self._momentum_buffers[key].shape)
+            index_bytes = calculate_index_bytes(numel, sampled_numel)
+
         self._error_buffers[key] = corrected - reconstructed
 
         bw.data_bytes = sign_bytes
-        bw.metadata_bytes = 4
+        bw.metadata_bytes = 4 + index_bytes
         bw.details = {
             "method": "1bit",
             "sign_bytes": sign_bytes,
             "scale_bytes": 4,
+            "index_bytes": index_bytes,
             "numel": numel,
+            "sampled_numel": sampled_numel,
+            "sample_ratio": self.sample_ratio,
             "mean_abs": mean_abs.item(),
-            "actual_ratio": (sign_bytes + 4) / (numel * 4),
+            "actual_ratio": (sign_bytes + 4 + index_bytes) / (numel * 4),
         }
         bw.compute()
 
@@ -129,6 +161,8 @@ class OneBitSGDCompressor:
             "original_shape": tensor.shape,
             "sign_bytes_packed": sign_bytes_tensor,
             "mean_abs": mean_abs,
+            "sample_idx": sample_idx,
+            "sampled_numel": sampled_numel,
             "numel": numel,
         }, bw
 
@@ -136,14 +170,24 @@ class OneBitSGDCompressor:
         self, compressed: torch.Tensor, meta: dict
     ) -> torch.Tensor:
         if meta["method"] == "1bit" and "sign_bytes_packed" in meta:
-            numel = meta["numel"]
-            signs_flat = _unpack_bytes_to_bits(meta["sign_bytes_packed"], numel)
-            signs_flat = signs_flat.to(torch.float32)
-            signs_flat[signs_flat == 0] = -1.0
+            sampled_numel = meta.get("sampled_numel", meta["numel"])
+            sampled_recon = _unpack_bytes_to_bits(meta["sign_bytes_packed"], sampled_numel)
+            sampled_recon = sampled_recon.to(torch.float32)
+            sampled_recon[sampled_recon == 0] = -1.0
             mean_abs = meta["mean_abs"]
-            reconstructed = signs_flat * mean_abs
+            sampled_recon = sampled_recon * mean_abs
+            if meta.get("sample_idx") is not None:
+                reconstructed = torch.zeros(meta["numel"], dtype=torch.float32, device=compressed.device)
+                reconstructed[meta["sample_idx"]] = sampled_recon
+            else:
+                reconstructed = sampled_recon
             return reconstructed.reshape(meta["original_shape"])
         return compressed.reshape(meta["original_shape"])
+
+    def pop_last_adjustment(self) -> Optional[Dict]:
+        adj = self._last_adjustment
+        self._last_adjustment = None
+        return adj
 
 
 class TopKCompressor:
@@ -269,8 +313,10 @@ class HybridCompressor:
         momentum_factor: float = 0.9,
         auto_adjust: bool = True,
         topk_fraction: float = 0.5,
-        min_topk_fraction: float = 0.1,
-        max_adjustment_factor: float = 0.7,
+        min_topk_fraction: float = 0.05,
+        max_adjustment_factor: float = 0.5,
+        residual_sample_ratio: Optional[float] = None,
+        min_residual_sample_ratio: float = 0.002,
     ):
         self.target_budget_ratio = target_budget_ratio
         self.warmup_steps = warmup_steps
@@ -278,21 +324,31 @@ class HybridCompressor:
         self.topk_fraction = topk_fraction
         self.min_topk_fraction = min_topk_fraction
         self.max_adjustment_factor = max_adjustment_factor
+        self.min_residual_sample_ratio = min_residual_sample_ratio
         self._step = 0
         self._last_bandwidth: Optional[BandwidthAccount] = None
         self._last_adjustment: Optional[Dict] = None
         self._adjustment_count = 0
 
+        if residual_sample_ratio is None:
+            full_1bit_ratio = 1.0 / 32.0 + 4.0 / 1024.0
+            desired_residual_budget = target_budget_ratio * 0.05
+            residual_sample_ratio = min(1.0, max(min_residual_sample_ratio, desired_residual_budget / max(full_1bit_ratio, 1e-6)))
+        self.residual_sample_ratio = residual_sample_ratio
+
+        initial_topk_ratio = target_budget_ratio * 0.05
         self.onebit = OneBitSGDCompressor(
             momentum_factor=momentum_factor,
             warmup_steps=warmup_steps,
-            target_budget_ratio=target_budget_ratio * (1 - topk_fraction),
-            auto_adjust=auto_adjust,
+            target_budget_ratio=target_budget_ratio * 0.5,
+            auto_adjust=False,
+            sample_ratio=self.residual_sample_ratio,
+            min_sample_ratio=min_residual_sample_ratio,
         )
         self.topk = TopKCompressor(
-            compression_ratio=target_budget_ratio * topk_fraction * 0.5,
-            target_budget_ratio=target_budget_ratio * topk_fraction,
-            auto_adjust=auto_adjust,
+            compression_ratio=initial_topk_ratio,
+            target_budget_ratio=target_budget_ratio * 0.5,
+            auto_adjust=False,
         )
 
     def _recalculate_budgets(self):
@@ -332,87 +388,114 @@ class HybridCompressor:
             "method": "hybrid",
             "topk_bw": topk_bw.__dict__,
             "onebit_bw": onebit_bw.__dict__,
-            "topk_fraction_before": self.topk_fraction,
         }
         bw.compute()
 
+        previous_ratio = bw.actual_ratio
+
         if self.auto_adjust and not bw.within_budget:
-            old_topk_fraction = self.topk_fraction
             old_topk_ratio = self.topk.compression_ratio
+            old_res_ratio = self.onebit.sample_ratio
             over_by = bw.actual_ratio - self.target_budget_ratio
 
-            at_min_fraction = self.topk_fraction <= self.min_topk_fraction + 1e-6
-            at_min_ratio = self.topk.compression_ratio <= self.topk.min_k / max(numel, 1) + 1e-9
+            min_topk_ratio = self.topk.min_k / max(numel, 1)
+            at_min_topk = self.topk.compression_ratio <= min_topk_ratio + 1e-9
+            at_min_res = self.onebit.sample_ratio <= self.onebit.min_sample_ratio + 1e-9
 
-            if at_min_fraction and at_min_ratio:
+            if at_min_topk and at_min_res:
                 self._last_adjustment = {
                     "step": self._step,
                     "module": key,
-                    "reason": f"Budget exceeded: {bw.actual_ratio*100:.2f}% > {bw.target_budget_ratio*100:.2f}%, but at lower bound (min_topk_fraction={self.min_topk_fraction}, min_k={self.topk.min_k})",
+                    "reason": (f"Budget exceeded: {bw.actual_ratio*100:.2f}% > "
+                               f"{bw.target_budget_ratio*100:.2f}%, but at lower bound "
+                               f"(min_topk_ratio={min_topk_ratio*100:.4f}%, "
+                               f"min_residual_sample={self.onebit.min_sample_ratio*100:.2f}%)"),
                     "at_lower_bound": True,
-                    "old_topk_fraction": old_topk_fraction,
-                    "new_topk_fraction": old_topk_fraction,
                     "old_topk_ratio": old_topk_ratio,
                     "new_topk_ratio": old_topk_ratio,
+                    "old_residual_ratio": old_res_ratio,
+                    "new_residual_ratio": old_res_ratio,
+                    "previous_ratio": previous_ratio,
+                    "adjusted_ratio": previous_ratio,
                     "adjustment_count": self._adjustment_count,
                 }
+                bw.adjusted_this_step = False
             else:
                 reduction_factor = max(
                     self.max_adjustment_factor,
                     self.target_budget_ratio / max(bw.actual_ratio, 1e-8),
                 )
 
-                new_topk_fraction = max(
-                    self.min_topk_fraction,
-                    self.topk_fraction * reduction_factor,
-                )
-                min_ratio = self.topk.min_k / max(numel, 1)
                 new_topk_ratio = max(
-                    min_ratio,
+                    min_topk_ratio,
                     self.topk.compression_ratio * reduction_factor,
                 )
-                self.topk_fraction = new_topk_fraction
-                self.topk.compression_ratio = new_topk_ratio
-                self._recalculate_budgets()
+                new_res_ratio = max(
+                    self.onebit.min_sample_ratio,
+                    self.onebit.sample_ratio * reduction_factor,
+                )
 
-                self._adjustment_count += 1
-                self._last_adjustment = {
-                    "step": self._step,
-                    "module": key,
-                    "reason": f"Hybrid exceeded: {bw.actual_ratio*100:.2f}% > {bw.target_budget_ratio*100:.2f}% (by {over_by*100:.2f}%)",
-                    "old_topk_fraction": old_topk_fraction,
-                    "new_topk_fraction": new_topk_fraction,
-                    "old_topk_ratio": old_topk_ratio,
-                    "new_topk_ratio": new_topk_ratio,
-                    "adjustment_count": self._adjustment_count,
-                    "at_lower_bound": False,
-                }
+                actually_changed = (
+                    abs(new_topk_ratio - old_topk_ratio) > 1e-12
+                    or abs(new_res_ratio - old_res_ratio) > 1e-12
+                )
 
-                topk_vals, topk_meta, topk_bw = self.topk.compress(tensor, f"{key}_topk_retry")
-                topk_reconstructed = self.topk.decompress(topk_vals, topk_meta)
-                residual = tensor - topk_reconstructed
-                onebit_vals, onebit_meta, onebit_bw = self.onebit.compress(residual, f"{key}_1bit_retry")
+                if not actually_changed:
+                    self._last_adjustment = {
+                        "step": self._step,
+                        "module": key,
+                        "reason": (f"Budget exceeded: {bw.actual_ratio*100:.2f}% > "
+                                   f"{bw.target_budget_ratio*100:.2f}%, but no further reduction possible"),
+                        "at_lower_bound": True,
+                        "old_topk_ratio": old_topk_ratio,
+                        "new_topk_ratio": old_topk_ratio,
+                        "old_residual_ratio": old_res_ratio,
+                        "new_residual_ratio": old_res_ratio,
+                        "previous_ratio": previous_ratio,
+                        "adjusted_ratio": previous_ratio,
+                        "adjustment_count": self._adjustment_count,
+                    }
+                    bw.adjusted_this_step = False
+                else:
+                    self.topk.compression_ratio = new_topk_ratio
+                    self.onebit.sample_ratio = new_res_ratio
+                    self._recalculate_budgets()
 
-                bw = BandwidthAccount(target_budget_ratio=self.target_budget_ratio)
-                bw.original_bytes = numel * 4
-                bw.data_bytes = topk_bw.data_bytes + onebit_bw.data_bytes
-                bw.metadata_bytes = topk_bw.metadata_bytes + onebit_bw.metadata_bytes + 8
-                bw.details = {
-                    "method": "hybrid",
-                    "topk_fraction_before": old_topk_fraction,
-                    "topk_fraction_after": self.topk_fraction,
-                    "topk_ratio_before": old_topk_ratio,
-                    "topk_ratio_after": self.topk.compression_ratio,
-                    "adjustment_count": self._adjustment_count,
-                }
-                bw.compute()
+                    topk_vals, topk_meta, topk_bw = self.topk.compress(tensor, f"{key}_topk_retry")
+                    topk_reconstructed = self.topk.decompress(topk_vals, topk_meta)
+                    residual = tensor - topk_reconstructed
+                    onebit_vals, onebit_meta, onebit_bw = self.onebit.compress(residual, f"{key}_1bit_retry")
 
-            bw.adjusted_this_step = True
-            bw.previous_ratio = bw.actual_ratio
-            bw.adjustment_details = self._last_adjustment
+                    new_bw = BandwidthAccount(target_budget_ratio=self.target_budget_ratio)
+                    new_bw.original_bytes = numel * 4
+                    new_bw.data_bytes = topk_bw.data_bytes + onebit_bw.data_bytes
+                    new_bw.metadata_bytes = topk_bw.metadata_bytes + onebit_bw.metadata_bytes + 8
+                    new_bw.compute()
 
-        bw.details["topk_fraction_current"] = self.topk_fraction
-        bw.details["topk_ratio_current"] = getattr(self.topk, 'compression_ratio', None)
+                    self._adjustment_count += 1
+                    self._last_adjustment = {
+                        "step": self._step,
+                        "module": key,
+                        "reason": (f"Hybrid exceeded: {previous_ratio*100:.2f}% > "
+                                   f"{bw.target_budget_ratio*100:.2f}% (by {over_by*100:.2f}%)"),
+                        "old_topk_ratio": old_topk_ratio,
+                        "new_topk_ratio": new_topk_ratio,
+                        "old_residual_ratio": old_res_ratio,
+                        "new_residual_ratio": new_res_ratio,
+                        "previous_ratio": previous_ratio,
+                        "adjusted_ratio": new_bw.actual_ratio,
+                        "adjustment_count": self._adjustment_count,
+                        "at_lower_bound": False,
+                    }
+
+                    bw = new_bw
+                    bw.adjusted_this_step = True
+                    bw.previous_ratio = previous_ratio
+                    bw.adjustment_details = self._last_adjustment
+
+        bw.details["topk_ratio_current"] = self.topk.compression_ratio
+        bw.details["residual_sample_ratio_current"] = self.onebit.sample_ratio
+        bw.details["adjustment_count"] = self._adjustment_count
 
         self._last_bandwidth = bw
         combined = {
@@ -426,7 +509,8 @@ class HybridCompressor:
             "method": "hybrid",
             "combined": combined,
             "original_shape": tensor.shape,
-            "topk_fraction": self.topk_fraction,
+            "topk_ratio": self.topk.compression_ratio,
+            "residual_sample_ratio": self.onebit.sample_ratio,
         }, bw
 
     def decompress(self, compressed: torch.Tensor, meta: dict) -> torch.Tensor:
@@ -448,8 +532,8 @@ class HybridCompressor:
 
     def get_current_params(self) -> Dict:
         return {
-            "topk_fraction": self.topk_fraction,
             "topk_compression_ratio": getattr(self.topk, 'compression_ratio', None),
+            "residual_sample_ratio": getattr(self.onebit, 'sample_ratio', None),
             "adjustment_count": self._adjustment_count,
         }
 
@@ -625,14 +709,15 @@ class GradientCompressor:
         elif self.method == "1bit":
             return {
                 "type": "1bit",
-                "fixed_ratio": "~1/32 + 4-byte scale",
+                "sample_ratio": getattr(self.compressor, "sample_ratio", 1.0),
+                "fixed_ratio_full_1bit": "~1/32 + 4-byte scale",
                 "approx_ratio_32bit": 1/32 + 4/(1024*4),
             }
         elif self.method == "hybrid":
             return {
                 "type": "hybrid",
-                "topk_fraction": getattr(self.compressor, "topk_fraction", None),
                 "topk_compression_ratio": getattr(self.compressor.topk, "compression_ratio", None) if hasattr(self.compressor, 'topk') else None,
+                "residual_sample_ratio": getattr(self.compressor.onebit, "sample_ratio", None) if hasattr(self.compressor, 'onebit') else None,
             }
         return {"type": "unknown"}
 
