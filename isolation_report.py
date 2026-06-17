@@ -337,8 +337,16 @@ class FrequencyMigrationTracker:
 
     def get_last_delta(self, module_name: str) -> Dict:
         history = self._history.get(module_name, [])
+        if not history:
+            return {"status": "no_data"}
         if len(history) < 2:
-            return {"status": "no_data" if not history else "single_point"}
+            last = history[-1]
+            return {
+                "status": "single_point",
+                "dominant_freq_last": last["dominant_freq"],
+                "centroid_last": last["spectral_centroid"],
+                "step_last": last["step"],
+            }
         last = history[-1]
         prev = history[-2]
         df = last["dominant_freq"] - prev["dominant_freq"]

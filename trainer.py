@@ -113,8 +113,8 @@ class CrosstalkFreeTrainer:
         self.bandwidth_budget = bandwidth_budget
         self.lr = lr
         self._step = 0
-        self._log_interval = 10
         self._report_interval = report_interval
+        self._log_interval = report_interval
         self._crosstalk_weight = crosstalk_loss_weight
         self._reg_weight = reg_loss_weight
 
@@ -162,6 +162,9 @@ class CrosstalkFreeTrainer:
         self._reports: List[Dict] = []
         self._prev_filter_params: Optional[List[Dict]] = None
         self._prev_filter_params_for_epoch: Optional[List[Dict]] = self.isolator.filter_bank.get_filter_parameters()
+        self._filter_stagnant_steps: Dict[str, int] = {name: 0 for name in module_names}
+        self._filter_stagnant_threshold = 3
+        self._filter_stagnant_min_delta = 1e-4
 
     def _get_current_lr(self) -> float:
         for param_group in self.optimizer.param_groups:
@@ -257,6 +260,22 @@ class CrosstalkFreeTrainer:
         filter_deltas = self.isolator.filter_bank.get_filter_delta(self._prev_filter_params)
         self._prev_filter_params = prev_params
 
+        filter_stagnant_info = {}
+        for idx, name in enumerate(self.module_names):
+            delta = filter_deltas[idx] if idx < len(filter_deltas) else {}
+            max_cf = abs(delta.get("max_cf_delta", 0.0))
+            max_bw = abs(delta.get("max_bw_delta", 0.0))
+            if max_cf < self._filter_stagnant_min_delta and max_bw < self._filter_stagnant_min_delta:
+                self._filter_stagnant_steps[name] = self._filter_stagnant_steps.get(name, 0) + 1
+            else:
+                self._filter_stagnant_steps[name] = 0
+            filter_stagnant_info[name] = {
+                "stagnant_steps": self._filter_stagnant_steps[name],
+                "is_stagnant": self._filter_stagnant_steps[name] >= self._filter_stagnant_threshold,
+                "max_cf_delta_abs": max_cf,
+                "max_bw_delta_abs": max_bw,
+            }
+
         with torch.no_grad():
             output_after = self.model(inputs_saved)
             loss_after_step = loss_fn(output_after, targets_saved).item()
@@ -271,11 +290,11 @@ class CrosstalkFreeTrainer:
             lr=current_lr,
         )
 
-        if iso_stats.get("freq_profiles") and iso_stats.get("peak_info"):
+        if iso_stats.get("freq_profiles") is not None:
             self.freq_tracker.record_step(
                 self._step,
                 iso_stats["freq_profiles"],
-                iso_stats["peak_info"],
+                iso_stats.get("peak_info", {}),
             )
 
         reports = {}
@@ -304,6 +323,7 @@ class CrosstalkFreeTrainer:
             "module_grad_info": module_grad_info,
             "filter_update_info": filter_param_update_info,
             "filter_deltas": filter_deltas,
+            "filter_stagnant": filter_stagnant_info,
             "bandwidth": {
                 "target_ratio": self.bandwidth_budget,
                 "actual_ratio": bandwidth.actual_ratio,
@@ -453,6 +473,7 @@ class CrosstalkFreeTrainer:
         deltas = log["filter_deltas"]
         grad_info = log["module_grad_info"]
         wb = log["writeback_validation"]
+        stagnant = log.get("filter_stagnant", {})
 
         budget_str = f"TARGET={bw['target_ratio']*100:.2f}% ACTUAL={bw['actual_ratio']*100:.2f}%"
         if bw["within_budget"]:
@@ -511,7 +532,7 @@ class CrosstalkFreeTrainer:
             status = "[ZERO!]" if all_zero else ("[OK]" if grad_norm > 0 else "[X]")
             print(f"    {name:<12}: |g|={grad_norm:.4e}, params w/ grad={params_w_grad}/{total_p}, elements={total_elem} {status}")
 
-        print("  -- Filter Parameter Update Status --")
+        print("  -- Filter Learning & Frequency Migration Status --")
         for idx, name in enumerate(self.module_names):
             fi = f_info.get(name, {})
             delta = deltas[idx] if idx < len(deltas) else {}
@@ -521,9 +542,28 @@ class CrosstalkFreeTrainer:
             max_bw_delta = delta.get("max_bw_delta", 0.0)
             cf_zero = "[CF=0!]" if fi.get("cf_grad_zero", True) else ""
             bw_zero = "[BW=0!]" if fi.get("bw_grad_zero", True) else ""
+
+            stag_info = stagnant.get(name, {})
+            stag_steps = stag_info.get("stagnant_steps", 0)
+            stag_tag = f"[STAGNANT x{stag_steps}]" if stag_info.get("is_stagnant", False) else ""
+
+            freq_delta = self.freq_tracker.get_last_delta(name)
+            if freq_delta["status"] == "no_data":
+                freq_str = "freq=[NO DATA]"
+            elif freq_delta["status"] == "single_point":
+                freq_str = f"dom_freq={freq_delta.get('dominant_freq_last', '?')} (init, no prev)"
+            else:
+                df = freq_delta["dominant_freq_delta"]
+                dc = freq_delta["centroid_delta"]
+                df_str = f"{df:+.0f}"
+                dc_str = f"{dc:+.2f}"
+                freq_str = (f"dom_freq={freq_delta['dominant_freq_prev']}→{freq_delta['dominant_freq_last']}({df_str}), "
+                           f"centroid={freq_delta['centroid_prev']:.1f}→{freq_delta['centroid_last']:.1f}({dc_str})")
+
             print(f"    {name:<12}: |g_cf|={cf_norm:.4e}, |g_bw|={bw_norm:.4e} "
-                  f"| Delta_cf(max)={max_cf_delta:+.4f}, Delta_bw(max)={max_bw_delta:+.4f} "
-                  f"{cf_zero}{bw_zero}")
+                  f"| Δcf(max)={max_cf_delta:+.4f}, Δbw(max)={max_bw_delta:+.4f} "
+                  f"{cf_zero}{bw_zero}{stag_tag}")
+            print(f"                  {freq_str}")
 
         print("  -- Per-Module Gradient Writeback Verification --")
         for name in self.module_names:
@@ -618,6 +658,21 @@ class CrosstalkFreeTrainer:
             print(f"      Bandwidth Delta:{bw_deltas}")
             print(f"      CF grad norm:   {cf_grad}")
             print(f"      BW grad norm:   {bw_grad}")
+
+        print(f"\n  Frequency Migration (this epoch):")
+        for name in self.module_names:
+            traj = self.freq_tracker.get_migration_trajectory(name)
+            if traj.get("status") == "no_data":
+                print(f"    {name:<12}: [NO DATA]")
+                continue
+            init_d = traj["initial_dominant"]
+            final_d = traj["final_dominant"]
+            dist = traj["migration_distance"]
+            centroids = traj["spectral_centroids"]
+            init_c = centroids[0] if centroids else 0
+            final_c = centroids[-1] if centroids else 0
+            print(f"    {name:<12}: dom_freq {init_d} → {final_d} (Δ={final_d - init_d:+d}, dist={dist})"
+                  f" | centroid {init_c:.2f} → {final_c:.2f} (Δ={final_c - init_c:+.2f})")
         print(f"{'='*80}\n")
 
     def get_filter_diagnostics(self) -> Dict:
