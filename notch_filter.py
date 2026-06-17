@@ -11,8 +11,8 @@ class LearnableNotchFilter(nn.Module):
         n_fft: int,
         num_filters: int = 8,
         init_bandwidth: float = 0.5,
-        min_bandwidth: float = 0.01,
-        max_bandwidth: float = 4.0,
+        min_bandwidth: float = 0.05,
+        max_bandwidth: float = 8.0,
         track_history: bool = True,
     ):
         super().__init__()
@@ -84,6 +84,8 @@ class LearnableNotchFilter(nn.Module):
             bw_grad = self.log_bandwidth.grad
             cf_grad_norm = cf_grad.norm().item() if cf_grad is not None else 0.0
             bw_grad_norm = bw_grad.norm().item() if bw_grad is not None else 0.0
+            cf_per_filter = cf_grad.abs().tolist() if cf_grad is not None else [0.0] * self.num_filters
+            bw_per_filter = bw_grad.abs().tolist() if bw_grad is not None else [0.0] * self.num_filters
             self._param_history.append({
                 "step": step,
                 "center_frequencies": centers,
@@ -93,6 +95,8 @@ class LearnableNotchFilter(nn.Module):
                 "step": step,
                 "center_freq_grad_norm": cf_grad_norm,
                 "bandwidth_grad_norm": bw_grad_norm,
+                "center_freq_per_filter_grad": cf_per_filter,
+                "bandwidth_per_filter_grad": bw_per_filter,
             })
 
     def get_param_history(self) -> List[Dict]:
@@ -120,8 +124,8 @@ class ModuleNotchFilterBank(nn.Module):
         num_modules: int = 4,
         num_filters_per_module: int = 6,
         init_bandwidth: float = 0.5,
-        min_bandwidth: float = 0.01,
-        max_bandwidth: float = 4.0,
+        min_bandwidth: float = 0.05,
+        max_bandwidth: float = 8.0,
         track_history: bool = True,
     ):
         super().__init__()
@@ -168,6 +172,29 @@ class ModuleNotchFilterBank(nn.Module):
             })
         return params
 
+    def get_filter_delta(self, prev_params: Optional[List[Dict]] = None) -> List[Dict]:
+        current = self.get_filter_parameters()
+        deltas = []
+        for idx, p in enumerate(current):
+            entry = {
+                "center_freq_delta": [0.0] * self.num_filters_per_module,
+                "bandwidth_delta": [0.0] * self.num_filters_per_module,
+                "max_cf_delta": 0.0,
+                "max_bw_delta": 0.0,
+            }
+            if prev_params and idx < len(prev_params):
+                prev = prev_params[idx]
+                cf_curr = p["center_frequencies"].tolist()
+                cf_prev = prev["center_frequencies"].tolist()
+                bw_curr = p["bandwidths"].tolist()
+                bw_prev = prev["bandwidths"].tolist()
+                entry["center_freq_delta"] = [c - p_v for c, p_v in zip(cf_curr, cf_prev)]
+                entry["bandwidth_delta"] = [c - p_v for c, p_v in zip(bw_curr, bw_prev)]
+                entry["max_cf_delta"] = max(abs(d) for d in entry["center_freq_delta"])
+                entry["max_bw_delta"] = max(abs(d) for d in entry["bandwidth_delta"])
+            deltas.append(entry)
+        return deltas
+
     def get_param_history(self) -> List[List[Dict]]:
         return [f.get_param_history() for f in self.filters]
 
@@ -179,31 +206,62 @@ class ModuleNotchFilterBank(nn.Module):
         module_magnitudes: List[torch.Tensor],
         module_names: List[str],
         crosstalk_weight: float = 0.1,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Dict]:
+        loss_details = {
+            "overlap_loss": 0.0,
+            "self_preserve_loss": 0.0,
+            "cross_suppress_loss": 0.0,
+        }
         if self.num_modules < 2:
-            return torch.tensor(0.0, device=next(self.parameters()).device)
+            return torch.tensor(0.0, device=next(self.parameters()).device), loss_details
 
         masks = [f.compute_filter_mask() for f in self.filters]
-        total_loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        freq_profiles = [m.mean(dim=-1) for m in module_magnitudes]
+        total_energy = sum(p.sum() for p in freq_profiles) + 1e-8
+
+        overlap_loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        self_preserve_loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        cross_suppress_loss = torch.tensor(0.0, device=next(self.parameters()).device)
 
         for i in range(self.num_modules):
+            prof_i = freq_profiles[i] / (freq_profiles[i].sum() + 1e-8)
+            topk_vals, topk_idx = torch.topk(prof_i, min(3, self.n_freq))
+            for k_idx in topk_idx:
+                self_preserve_loss = self_preserve_loss + (1.0 - masks[i][k_idx]) * prof_i[k_idx]
+
             for j in range(self.num_modules):
                 if i == j:
                     continue
                 overlap = masks[i] * masks[j]
-                energy = (module_magnitudes[i].mean(dim=-1) * overlap).sum()
-                total_loss = total_loss + energy
-        return crosstalk_weight * total_loss
+                energy_ij = (freq_profiles[i] * overlap).sum()
+                overlap_loss = overlap_loss + energy_ij / total_energy
+
+                prof_j = freq_profiles[j] / (freq_profiles[j].sum() + 1e-8)
+                topk_vals_j, topk_idx_j = torch.topk(prof_j, min(3, self.n_freq))
+                for k_idx in topk_idx_j:
+                    cross_suppress_loss = cross_suppress_loss + masks[i][k_idx] * prof_j[k_idx]
+
+        loss_details["overlap_loss"] = overlap_loss.item()
+        loss_details["self_preserve_loss"] = self_preserve_loss.item()
+        loss_details["cross_suppress_loss"] = cross_suppress_loss.item()
+
+        total = (
+            1.0 * overlap_loss
+            + 2.0 * self_preserve_loss
+            + 1.5 * cross_suppress_loss
+        )
+        return crosstalk_weight * total, loss_details
 
     def regularization_loss(self) -> torch.Tensor:
         loss = torch.tensor(0.0, device=next(self.parameters()).device)
         for f in self.filters:
             bws = f.bandwidths
             centers = f.center_frequencies
-            loss = loss + (bws ** 2).mean()
+            loss = loss + 0.1 * (bws ** 2).mean()
             sorted_centers, _ = torch.sort(centers)
             center_spacing = sorted_centers[1:] - sorted_centers[:-1]
-            loss = loss + 0.1 * torch.exp(-10 * center_spacing).mean()
+            loss = loss + 0.5 * torch.exp(-5.0 * center_spacing).mean()
+            loss = loss + 0.01 * ((centers - self.n_freq / 2) ** 2).mean() / (self.n_freq ** 2)
         return loss
 
     def get_all_masks(self) -> torch.Tensor:

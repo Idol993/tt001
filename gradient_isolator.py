@@ -87,6 +87,7 @@ class GradientIsolator(nn.Module):
             self.register_model_structure(model, module_names)
 
         grads = {}
+        module_grad_norms = {}
         for mod_name in module_names:
             total_size = self._module_total_sizes[mod_name]
             module_grad = torch.zeros(
@@ -95,13 +96,26 @@ class GradientIsolator(nn.Module):
                 dtype=next(model.parameters()).dtype,
             )
             slices = self._module_param_slices[mod_name]
+            filled_count = 0
             for slice_info in slices:
                 param = dict(model.named_parameters())[slice_info.param_name]
                 if param.grad is not None:
                     grad_flat = param.grad.detach().reshape(-1)
                     module_grad[slice_info.offset:slice_info.offset + slice_info.length] = grad_flat
+                    filled_count += 1
             grads[mod_name] = module_grad
+            module_grad_norms[mod_name] = {
+                "norm": module_grad.norm().item(),
+                "total_params": len(slices),
+                "params_with_grad": filled_count,
+                "total_elements": total_size,
+                "all_zero": module_grad.abs().sum().item() == 0,
+            }
+        self._last_module_grad_info = module_grad_norms
         return grads, self._module_param_slices
+
+    def get_last_module_grad_info(self) -> Dict:
+        return getattr(self, "_last_module_grad_info", {})
 
     def initialize_filters_from_peaks(
         self, module_grads: Dict[str, torch.Tensor], module_names: List[str]
@@ -203,11 +217,14 @@ class GradientIsolator(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         magnitudes = []
         for name in module_names:
-            mag, _ = self.analyzer.forward_stft(module_grads[name])
-            magnitudes.append(mag)
+            grad_with_grad = module_grads[name].clone().detach().requires_grad_(False)
+            mag, _ = self.analyzer.forward_stft(grad_with_grad)
+            mag_for_loss = mag.detach()
+            mag_param_flow, _ = self.analyzer.forward_stft(module_grads[name].clone())
+            magnitudes.append(mag_param_flow)
 
         reg_loss = self.reg_weight * self.filter_bank.regularization_loss()
-        crosstalk_loss = self.filter_bank.compute_crosstalk_loss(
+        crosstalk_loss, loss_breakdown = self.filter_bank.compute_crosstalk_loss(
             magnitudes, module_names, self.crosstalk_loss_weight
         )
 
@@ -215,6 +232,7 @@ class GradientIsolator(nn.Module):
             "reg_loss": reg_loss,
             "crosstalk_loss": crosstalk_loss,
             "total_aux_loss": reg_loss + crosstalk_loss,
+            "loss_breakdown": loss_breakdown,
         }
 
     def get_regularization_loss(self) -> torch.Tensor:
@@ -233,10 +251,18 @@ class GradientIsolator(nn.Module):
             "shape_matches": True,
             "count_matches": True,
             "mismatches": [],
+            "per_module": {},
         }
 
         for mod_name in module_names:
+            mod_stats = {
+                "total_params": 0,
+                "validated_params": 0,
+                "total_elements": 0,
+                "mismatches": [],
+            }
             if mod_name not in isolated_grads or mod_name not in self._module_param_slices:
+                validation["per_module"][mod_name] = mod_stats
                 continue
 
             isolated = isolated_grads[mod_name]
@@ -247,14 +273,22 @@ class GradientIsolator(nn.Module):
                 if param.grad is None:
                     continue
 
+                mod_stats["total_params"] += 1
+                mod_stats["total_elements"] += slice_info.numel
                 validation["total_params"] += 1
+
                 slice_start = slice_info.offset
                 slice_end = slice_info.offset + slice_info.length
 
                 if slice_end > isolated.numel():
+                    msg = f"isolated grad too small: {isolated.numel()} < {slice_end}"
                     validation["mismatches"].append({
                         "param": slice_info.param_name,
-                        "reason": f"isolated grad too small: {isolated.numel()} < {slice_end}",
+                        "reason": msg,
+                    })
+                    mod_stats["mismatches"].append({
+                        "param": slice_info.param_name,
+                        "reason": msg,
                     })
                     validation["count_matches"] = False
                     continue
@@ -262,27 +296,55 @@ class GradientIsolator(nn.Module):
                 grad_slice = isolated[slice_start:slice_end]
 
                 if grad_slice.numel() != slice_info.numel:
+                    msg = f"numel mismatch: {grad_slice.numel()} != {slice_info.numel}"
                     validation["mismatches"].append({
                         "param": slice_info.param_name,
-                        "reason": f"numel mismatch: {grad_slice.numel()} != {slice_info.numel}",
+                        "reason": msg,
+                    })
+                    mod_stats["mismatches"].append({
+                        "param": slice_info.param_name,
+                        "reason": msg,
                     })
                     validation["count_matches"] = False
                     continue
 
                 if validate:
-                    old_grad = param.grad.clone()
+                    old_shape = param.grad.shape
+                    old_numel = param.grad.numel()
 
                 param.grad.copy_(grad_slice.reshape(slice_info.shape))
 
                 if validate:
                     if param.grad.shape != slice_info.shape:
+                        msg = f"shape mismatch after writeback: {param.grad.shape} != {slice_info.shape}"
                         validation["mismatches"].append({
                             "param": slice_info.param_name,
-                            "reason": f"shape mismatch: {param.grad.shape} != {slice_info.shape}",
+                            "reason": msg,
+                        })
+                        mod_stats["mismatches"].append({
+                            "param": slice_info.param_name,
+                            "reason": msg,
+                        })
+                        validation["shape_matches"] = False
+                    elif old_shape != slice_info.shape or old_numel != slice_info.numel:
+                        msg = f"shape/numel mismatch: expected {slice_info.shape} ({slice_info.numel} elements), got {old_shape} ({old_numel} elements)"
+                        validation["mismatches"].append({
+                            "param": slice_info.param_name,
+                            "reason": msg,
+                        })
+                        mod_stats["mismatches"].append({
+                            "param": slice_info.param_name,
+                            "reason": msg,
                         })
                         validation["shape_matches"] = False
                     else:
                         validation["validated_params"] += 1
+                        mod_stats["validated_params"] += 1
+                else:
+                    validation["validated_params"] += 1
+                    mod_stats["validated_params"] += 1
+
+            validation["per_module"][mod_name] = mod_stats
 
         self._last_writeback_validation = validation
         return validation

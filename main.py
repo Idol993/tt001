@@ -61,8 +61,8 @@ def main():
         compression_method="topk",
         bandwidth_budget=BUDGET_RATIO,
         device=device,
-        report_interval=5,
-        crosstalk_loss_weight=0.5,
+        report_interval=3,
+        crosstalk_loss_weight=0.15,
         reg_loss_weight=0.01,
     )
 
@@ -170,23 +170,45 @@ def main():
     print_separator("6. Writeback Verification Summary")
     total_params = 0
     total_mismatches = 0
+    per_module_wb = {}
+    for name in module_names:
+        per_module_wb[name] = {"total_params": 0, "validated_params": 0, "total_elements": 0, "mismatch_count": 0, "steps_with_issue": 0}
     for log in all_logs:
         wb = log['writeback_validation']
         total_params += wb['total_params']
         if not wb['shape_matches'] or not wb['count_matches']:
             total_mismatches += 1
-            if wb['mismatches']:
-                print(f"  Step {log['step']} mismatches:")
-                for m in wb['mismatches']:
-                    print(f"    - {m['param']}: {m['reason']}")
+        for name in module_names:
+            mod_wb = wb.get("per_module", {}).get(name, {})
+            per_module_wb[name]["total_params"] += mod_wb.get("total_params", 0)
+            per_module_wb[name]["validated_params"] += mod_wb.get("validated_params", 0)
+            per_module_wb[name]["total_elements"] += mod_wb.get("total_elements", 0)
+            mismatches = mod_wb.get("mismatches", [])
+            per_module_wb[name]["mismatch_count"] += len(mismatches)
+            if len(mismatches) > 0 or mod_wb.get("validated_params", 0) != mod_wb.get("total_params", 0):
+                per_module_wb[name]["steps_with_issue"] += 1
+                for m in mismatches:
+                    print(f"  Step {log['step']} [{name}] mismatch: {m}")
 
     print(f"\n  Total gradient writeback operations: {len(all_logs)}")
     print(f"  Total parameter slices processed:   {total_params}")
-    print(f"  Steps with writeback errors:        {total_mismatches}")
-    if total_mismatches == 0:
-        print(f"  [OK] ALL WRITEBACK OPERATIONS VERIFIED - SHAPE AND COUNT MATCH")
+    print(f"  Steps with overall writeback errors:{total_mismatches}")
+
+    print(f"\n  Per-Module Writeback Breakdown:")
+    all_ok = True
+    for name in module_names:
+        pw = per_module_wb[name]
+        status = "[OK]" if (pw["validated_params"] == pw["total_params"] and pw["mismatch_count"] == 0 and pw["total_params"] > 0) else "[X]"
+        if status == "[X]":
+            all_ok = False
+        print(f"    {name:<12}: slices={pw['validated_params']}/{pw['total_params']}, "
+              f"elements={pw['total_elements']}, mismatches={pw['mismatch_count']}, "
+              f"bad_steps={pw['steps_with_issue']} {status}")
+
+    if all_ok:
+        print(f"\n  [OK] ALL MODULE WRITEBACK OPERATIONS VERIFIED - SHAPE AND COUNT MATCH PER MODULE")
     else:
-        print(f"  [X] {total_mismatches} STEPS HAD WRITEBACK ERRORS")
+        print(f"\n  [X] SOME MODULES HAD WRITEBACK ERRORS")
 
     print_separator("7. Final Crosstalk Matrix")
     final_crosstalk = None

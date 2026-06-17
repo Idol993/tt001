@@ -334,3 +334,23 @@ class FrequencyMigrationTracker:
             lines.append(f"    Migration distance:    {traj['migration_distance']} bins")
             lines.append(f"    Final centroid:        {traj['spectral_centroids'][-1]:.2f}")
         return "\n".join(lines)
+
+    def get_last_delta(self, module_name: str) -> Dict:
+        history = self._history.get(module_name, [])
+        if len(history) < 2:
+            return {"status": "no_data" if not history else "single_point"}
+        last = history[-1]
+        prev = history[-2]
+        df = last["dominant_freq"] - prev["dominant_freq"]
+        dc = last["spectral_centroid"] - prev["spectral_centroid"]
+        return {
+            "status": "ok",
+            "dominant_freq_prev": prev["dominant_freq"],
+            "dominant_freq_last": last["dominant_freq"],
+            "dominant_freq_delta": df,
+            "centroid_prev": prev["spectral_centroid"],
+            "centroid_last": last["spectral_centroid"],
+            "centroid_delta": dc,
+            "step_prev": prev["step"],
+            "step_last": last["step"],
+        }
